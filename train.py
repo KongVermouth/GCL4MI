@@ -11,33 +11,36 @@ import numpy as np
 import faiss
 import tensorflow as tf
 from data_iterator import DataIterator
-from model import *
 from tensorboardX import SummaryWriter
 import warnings
-# import seaborn as sns
-# import matplotlib.pyplot as plt
-# from sklearn.manifold import TSNE
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+# from MGNM import *
+# from model import *       # baseline
+from MyModel import *       # GCL4MI
+from matplotlib.colors import rgb2hex
+from sklearn.preprocessing import MinMaxScaler
+import umap
 
 
-warnings.filterwarnings('ignore')
 parser = argparse.ArgumentParser()
 parser.add_argument('-p', type=str, default='train', help='train | test')
 parser.add_argument('--dataset', type=str, default='book', help='book | taobao')
 parser.add_argument('--random_seed', type=int, default=19)
 parser.add_argument('--embedding_dim', type=int, default=64)
 parser.add_argument('--hidden_size', type=int, default=64)
-parser.add_argument('--num_interest', type=int, default=8)
-parser.add_argument('--model_type', type=str, default='Re4', help='DNN | GRU4REC | ..')
+parser.add_argument('--num_interest', type=int, default=4)
+parser.add_argument('--model_type', type=str, default='My', help='DNN | GRU4REC | ..')
 parser.add_argument('--learning_rate', type=float, default=0.001, help='')
-parser.add_argument('--max_iter', type=int, default=5, help='(k)')
-parser.add_argument('--patience', type=int, default=110)
+parser.add_argument('--max_iter', type=int, default=140, help='(k)')
+parser.add_argument('--patience', type=int, default=50)
 parser.add_argument('--coef', default=None)
 parser.add_argument('--topN', type=int, default=50)
 parser.add_argument('--time_span', type=int, default=64)
 parser.add_argument('--ta', type=int, default=0)
 
-best_metric = 1
+best_metric = 0
 
 
 def prepare_data(src, matrix, target):
@@ -71,13 +74,13 @@ def compute_diversity(item_list, item_cate_map):
 def evaluate_full(sess, test_data, model, model_path, batch_size, topN):
     item_embs = model.output_item(sess)
 
-    # res = faiss.StandardGpuResources()
-    # flat_config = faiss.GpuIndexFlatConfig()
-    # flat_config.device = 1
+    res = faiss.StandardGpuResources()
+    flat_config = faiss.GpuIndexFlatConfig()
+    flat_config.device = 0
 
     try:
-        # gpu_index = faiss.GpuIndexFlatIP(res, args.embedding_dim, flat_config)
-        gpu_index = faiss.IndexFlatIP(args.embedding_dim)
+        gpu_index = faiss.GpuIndexFlatIP(res, args.embedding_dim, flat_config)
+        # gpu_index = faiss.IndexFlatIP(args.embedding_dim)
         gpu_index.add(item_embs)
     except Exception as e:
         return {}
@@ -89,9 +92,10 @@ def evaluate_full(sess, test_data, model, model_path, batch_size, topN):
     total_map = 0.0
     for src, matrix, tgt in test_data:
         nick_id, item_id, adj_matrix, time_matrix, hist_item, hist_mask = prepare_data(src, matrix, tgt)
-        user_embs = model.output_user(sess, hist_item, hist_mask)
-        # gat, X = model.output_variable(sess, hist_item, hist_mask)
-
+        if args.model_type == "MIP":
+            user_embs = model.output_user_mip(sess, hist_item, time_matrix, hist_mask)
+        else:
+            user_embs = model.output_user(sess, hist_item, hist_mask)
         if len(user_embs.shape) == 2:
             D, I = gpu_index.search(user_embs, topN)
             for i, iid_list in enumerate(item_id):
@@ -165,15 +169,22 @@ def get_model(dataset, model_type, item_count, batch_size, maxlen):
     elif model_type == 'Re4':
         model = Re4(item_count, args.embedding_dim, args.hidden_size, batch_size, args.num_interest, maxlen)
     elif model_type == 'My':
-        model = Model_My(item_count, args.embedding_dim, args.hidden_size, batch_size, args.num_interest, args.time_span, maxlen)
+        model = Model(item_count, args.embedding_dim, args.hidden_size, batch_size, args.num_interest, maxlen)
+    elif model_type == 'MIP':
+        model = MIP(item_count, args.embedding_dim, args.hidden_size, batch_size, args.num_interest, args.time_span, maxlen)
+    elif model_type == 'MGNM':
+        neg_num = 10
+        model = modelTy(item_count, args.embedding_dim, batch_size, maxlen, neg_num, args.hidden_size, args.num_interest, num_layer=3, se_num=0)
     else:
         print("Invalid model_type : %s", model_type)
         return
     return model
 
 
+# def get_exp_name(dataset, batch_size, time_span, embedding_dim, lr, maxlen, extr_name, save=True):
 def get_exp_name(dataset, batch_size, time_span, embedding_dim, lr, maxlen, save=True):
-    extr_name = "Re4"
+    extr_name = '_'.join([str(args.model_type), str(args.num_interest)])
+    extr_name = "GCL4MI_k=4"
     para_name = '_'.join([dataset, 'b' + str(batch_size), 'ts' + str(time_span), 'd' + str(embedding_dim), 'lr' + str(lr), 'len' + str(maxlen)])
     exp_name = para_name + '_' + extr_name
 
@@ -184,7 +195,7 @@ def train(train_file, valid_file, test_file, item_count, batch_size=128, maxlen=
           max_iter=100, patience=20):
     exp_name = get_exp_name(args.dataset, batch_size, args.time_span, args.embedding_dim, lr, maxlen)
 
-    best_model_path = "./best_model/" + exp_name + '/'
+    best_model_path = "best_model/" + exp_name + '/'
 
     gpu_options = tf.GPUOptions(allow_growth=True)
 
@@ -213,14 +224,13 @@ def train(train_file, valid_file, test_file, item_count, batch_size=128, maxlen=
 
                 for src, matrix, tgt in train_data:
                     data_iter = prepare_data(src, matrix, tgt)
+                    # if args.model_type == "My":
+                    #     loss = model.train(sess, list(data_iter) + [lr])
+                    # else:
                     loss = model.train(sess, list(data_iter[:2]) + list(data_iter[4:]) + [lr])
-                    # print(loss)
                     loss_sum += loss
                     iter += 1
 
-                    # interval = 100
-                    # iter_list = [test_iter * interval * (i + 1) for i in range(2 * max_iter // interval)]
-                    # if iter in iter_list:
                     if iter % test_iter == 0:
                         log_str = 'iter: %d, train loss: %.4f' % (iter, loss_sum / test_iter)
 
@@ -268,7 +278,7 @@ def train(train_file, valid_file, test_file, item_count, batch_size=128, maxlen=
                 print('-' * 89)
                 print('Exiting from training early')
 
-            # model.restore(sess, best_model_path)
+            model.restore(sess, best_model_path)
 
             metrics = evaluate_full(sess, valid_data, model, best_model_path, batch_size, 20)
             print(', '.join(['valid_20 ' + key + ': %.6f' % value for key, value in metrics.items()]))
@@ -299,10 +309,10 @@ def test(
         lr=0.001,
 ):
     exp_name = get_exp_name(args.dataset, batch_size, args.time_span, args.embedding_dim, lr, maxlen, save=False)
-    best_model_path = "./best_model/" + exp_name + '/'
+    best_model_path = "best_model/" + exp_name + '/'
     gpu_options = tf.GPUOptions(allow_growth=True)
     model = get_model(dataset, model_type, item_count, batch_size, maxlen)
-
+    start_time = time.time()
     with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
         model.restore(sess, best_model_path)
         
@@ -311,6 +321,9 @@ def test(
         print(', '.join(['test ' + key + ': %.6f' % value for key, value in metrics.items()]))
         metrics = evaluate_full(sess, test_data, model, best_model_path, batch_size, 50)
         print(', '.join(['test ' + key + ': %.6f' % value for key, value in metrics.items()]))
+
+    end_time = time.time()
+    print("time interval: %.4f min" % ((end_time - start_time) / 60.0))
 
 def output(
         item_count,
@@ -321,7 +334,7 @@ def output(
         lr=0.001
 ):
     exp_name = get_exp_name(args.dataset, batch_size, args.time_span, args.embedding_dim, lr, maxlen, save=False)
-    best_model_path = "./best_model/" + exp_name + '/'
+    best_model_path = "best_model/" + exp_name + '/'
     gpu_options = tf.GPUOptions(allow_growth=True)
     model = get_model(dataset, model_type, item_count, batch_size, maxlen)
 
@@ -329,114 +342,6 @@ def output(
         model.restore(sess, best_model_path)
         item_embs = model.output_item(sess)
         np.save('output/' + exp_name + '_emb.npy', item_embs)
-
-
-def draw(
-        item_count,
-        test_file,
-        dataset="book",
-        batch_size=128,
-        maxlen=100,
-        model_type='DNN',
-        lr=0.001,
-):
-    exp_name = get_exp_name(args.dataset, batch_size, args.time_span, args.embedding_dim, lr, maxlen, save=False)
-    best_model_path = "./best_model/" + exp_name + '/'
-    gpu_options = tf.GPUOptions(allow_growth=True)
-    model = get_model(dataset, model_type, item_count, batch_size, maxlen)
-
-    global cor_all
-    cor_all = 0
-    batchs = 0
-    test_data = DataIterator(test_file, batch_size, maxlen, train_flag=2)
-    with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
-        model.restore(sess, best_model_path)
-        item_embs = model.output_item(sess)
-        for src, matrix, tgt in test_data:
-            nick_id, item_id, adj_matrix, time_matrix, hist_item, hist_mask = prepare_data(src, matrix, tgt)
-            user_embs = model.output_user(sess, hist_item, hist_mask)
-
-            # 计算学习到的多兴趣之间相关性
-            global cor_batch
-            cor_batch = 0
-            for i in range(user_embs.shape[0]):
-                cor_batch += np.corrcoef(user_embs[i, :, :])
-            cor_batch /= user_embs.shape[0]
-            batchs += 1
-            cor_all += cor_batch
-        cor_all /= batchs
-
-        # print(cor_all)
-        # plt.subplots(figsize=(6, 6))
-        # sns.heatmap(cor_all, annot=True, vmax=1, square=True, cmap="Reds")
-        # plt.show()
-
-        # 整体item + 兴趣一起tsne
-        # item_embs = model.output_item(sess)     # 367983
-        # data = np.array([[8229, 3197, 482, 438, 18143, 167983, 45, 453, 16, 4206, 579, 196, 2504, 412, 1106, 7949, 124,
-        #                   10029, 177, 644],
-        #                  [2148, 10514, 10257, 43373, 7125, 3780, 2503, 98, 6209, 5832, 23896, 3658, 31914, 366, 9538,
-        #                   5780, 2027, 4480, 15266, 1118],
-        #                  [142636, 19967, 56998, 17580, 33210, 4351, 61461, 3073, 63333, 82373, 57298, 6151, 148183,
-        #                   32186, 90036, 108005, 209186, 7736, 180305, 173610],
-        #                  [181667, 276482, 313776, 28631, 144828, 74327, 4077, 79968, 313774, 166230, 51683, 276495,
-        #                   279030, 261340, 243161, 71930, 166222, 297955, 281592, 222454],
-        #                  [5541, 45174, 4434, 1500, 12157, 8088, 4527, 4035, 14035, 21368, 6691, 2778, 27501, 14755,
-        #                   2867, 5894, 73810, 37202, 1557, 8980]])
-        #
-        # data_mask = np.ones((5, maxlen))
-        # user_embs = model.output_user(sess, [data, data_mask])    # [5, k, dim]
-        # # mask_0, mask_1, mask_2, mask_3 = model.output_variable(sess, [hist_item, hist_mask])
-        # user_embs = user_embs.reshape(-1, args.embedding_dim)
-        # total_data = np.concatenate((item_embs, user_embs), axis=0)
-        # total_data_tsne = TSNE(n_components=2, perplexity=50.0, metric='euclidean').fit_transform(total_data)
-        # item_tsne = total_data_tsne[np.squeeze(data.reshape(-1, 1))]
-        # interest_tsne = total_data_tsne[367983::]
-        # plt.plot(item_tsne[0:20, 0], item_tsne[0:20, 1], 'ro')
-        # plt.plot(item_tsne[20:40, 0], item_tsne[20:40, 1], 'go')
-        # plt.plot(item_tsne[40:60, 0], item_tsne[40:60, 1], 'bo')
-        # plt.plot(item_tsne[60:80, 0], item_tsne[60:80, 1], 'ko')
-        # plt.plot(item_tsne[80:100, 0], item_tsne[80:100, 1], 'co')
-        #
-        # plt.plot(interest_tsne[0:4, 0], interest_tsne[0:4, 1], 'rD', markersize=8)
-        # plt.plot(interest_tsne[4:8, 0], interest_tsne[4:8, 1], 'gD', markersize=8)
-        # plt.plot(interest_tsne[8:12, 0], interest_tsne[8:12, 1], 'bD', markersize=8)
-        # plt.plot(interest_tsne[12:16, 0], interest_tsne[12:16, 1], 'kD', markersize=8)
-        # plt.plot(interest_tsne[16:20, 0], interest_tsne[16:20, 1], 'cD', markersize=8)
-        # plt.show()
-
-        # tsne
-        # data = np.array([[8229, 3197, 482, 438, 18143, 167983, 45, 453, 16, 4206, 579, 196, 2504, 412, 1106, 7949, 124,
-        #                   10029, 177, 644],
-        #                  [2148, 10514, 10257, 43373, 7125, 3780, 2503, 98, 6209, 5832, 23896, 3658, 31914, 366, 9538,
-        #                   5780, 2027, 4480, 15266, 1118],
-        #                  [142636, 19967, 56998, 17580, 33210, 4351, 61461, 3073, 63333, 82373, 57298, 6151, 148183,
-        #                   32186, 90036, 108005, 209186, 7736, 180305, 173610],
-        #                  [181667, 276482, 313776, 28631, 144828, 74327, 4077, 79968, 313774, 166230, 51683, 276495,
-        #                   279030, 261340, 243161, 71930, 166222, 297955, 281592, 222454],
-        #                  [5541, 45174, 4434, 1500, 12157, 8088, 4527, 4035, 14035, 21368, 6691, 2778, 27501, 14755,
-        #                   2867, 5894, 73810, 37202, 1557, 8980]])
-        #
-        # data_mask = np.ones((5, maxlen))
-        # user_embs = model.output_user(sess, data, data_mask)    # [5, k, dim]
-        #
-        # user_embs = user_embs.reshape(-1, args.embedding_dim)
-        # data = np.squeeze(data.reshape(-1, 1))
-        # item_embs_data = item_embs[data]
-        # total_embs_data = np.concatenate((item_embs_data, user_embs), axis=0)
-        # item_embs_tsne = TSNE(n_components=2, perplexity=25.0, metric='euclidean').fit_transform(total_embs_data)
-        # plt.plot(item_embs_tsne[0:20, 0], item_embs_tsne[0:20, 1], 'ro')
-        # plt.plot(item_embs_tsne[20:40, 0], item_embs_tsne[20:40, 1], 'go')
-        # plt.plot(item_embs_tsne[40:60, 0], item_embs_tsne[40:60, 1], 'bo')    #
-        # plt.plot(item_embs_tsne[60:80, 0], item_embs_tsne[60:80, 1], 'ko')    #
-        # plt.plot(item_embs_tsne[80:100, 0], item_embs_tsne[80:100, 1], 'co')
-        #
-        # plt.plot(item_embs_tsne[100:104, 0], item_embs_tsne[100:104, 1], 'rD', markersize=8)
-        # plt.plot(item_embs_tsne[104:108, 0], item_embs_tsne[104:108, 1], 'gD', markersize=8)
-        # plt.plot(item_embs_tsne[108:112, 0], item_embs_tsne[108:112, 1], 'bD', markersize=8)
-        # plt.plot(item_embs_tsne[112:116, 0], item_embs_tsne[112:116, 1], 'kD', markersize=8)
-        # plt.plot(item_embs_tsne[116:120, 0], item_embs_tsne[116:120, 1], 'cD', markersize=8)
-        # plt.show()
 
 
 if __name__ == '__main__':
@@ -453,43 +358,50 @@ if __name__ == '__main__':
     test_name = 'test'
 
     if args.dataset == 'taobao':
-        path = '../data/taobao_data/'
+        path = '/mnt/e/model_code/data/taobao_data/'
         item_count = 1708531
         batch_size = 256
         maxlen = 50
         test_iter = 500
 
     elif args.dataset == 'book':
-        path = '../data/book_data/'
+        path = '/mnt/e/model_code/data/book_data/'
         item_count = 367983
-        batch_size = 128
+        batch_size = 1024
         maxlen = 20
         test_iter = 1000
 
     elif args.dataset == 'movielens':
-        path = '../data/movielens_data/'
+        path = '/mnt/e/model_code/data/movielens_data/'
         item_count = 3417
         batch_size = 128
         maxlen = 20
         test_iter = 1000
 
     elif args.dataset == 'ml-10m':
-        path = '../data/ml-10m_data/'
+        path = '/mnt/e/model_code/data/ml-10m_data/'
         item_count = 10197
         batch_size = 128
         maxlen = 10
         test_iter = 1000
 
     elif args.dataset == 'gowalla_3w':
-        path = '../data/gowalla_data_3w/'
+        path = '/mnt/e/model_code/data/gowalla_data_3w/'
         item_count = 40982
-        batch_size = 128
+        batch_size = 1024
         maxlen = 20
         test_iter = 1000
 
     elif args.dataset == 'gowalla':
-        path = '../data/gowalla_data/'
+        path = '/mnt/e/model_code/data/gowalla_data/'
         item_count = 75382
+        batch_size = 128
+        maxlen = 10
+        test_iter = 1000
+
+    elif args.dataset == 'Electronics':
+        path = '/mnt/e/model_code/data/Electronics_data/'
+        item_count = 63002
         batch_size = 128
         maxlen = 10
         test_iter = 1000
@@ -509,9 +421,6 @@ if __name__ == '__main__':
              model_type=args.model_type, lr=args.learning_rate)
     elif args.p == 'output':
         output(item_count=item_count, dataset=args.dataset, batch_size=batch_size, maxlen=maxlen,
-               model_type=args.model_type, lr=args.learning_rate)
-    elif args.p == 'draw':
-        draw(item_count=item_count, test_file=test_file, dataset=args.dataset, batch_size=batch_size, maxlen=maxlen,
                model_type=args.model_type, lr=args.learning_rate)
     else:
         print('do nothing...')
