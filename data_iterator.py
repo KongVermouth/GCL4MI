@@ -95,6 +95,9 @@ class DataIterator:
                 raise StopIteration
             user_id_list = self.users[self.index: self.index + self.eval_batch_size]
             self.index += self.eval_batch_size
+            if self.index >= total_user:
+                self.index = 0
+                raise StopIteration
 
         item_id_list = []
         adj_matrix_list = []
@@ -114,11 +117,23 @@ class DataIterator:
                 hist_item_list.append(item_list[k - self.maxlen: k])
                 hist_mask_list.append([1.0] * self.maxlen)
                 adj_matrix_list.append(self.compute_adj_matrix([1.0] * self.maxlen, self.maxlen))
-                time_matrix_list.append(self.compute_time_matrix(time_list[k - self.maxlen: k], self.maxlen))
+                # time_matrix_list.append(self.compute_time_matrix(time_list[k - self.maxlen: k], self.maxlen))
+                time_matrix_list.append(time_list[k - self.maxlen: k])
             else:
                 hist_item_list.append(item_list[:k] + [0] * (self.maxlen - k))
                 hist_mask_list.append([1.0] * k + [0.0] * (self.maxlen - k))
                 adj_matrix_list.append(self.compute_adj_matrix([1.0] * k + [0.0] * (self.maxlen - k), k))
-                time_matrix_list.append(self.compute_time_matrix(time_list[:k] + [0] * (self.maxlen - k), k))
+                # time_matrix_list.append(self.compute_time_matrix(time_list[:k] + [0] * (self.maxlen - k), k))
+                time_matrix_list.append(time_list[k - self.maxlen: k])
+
+        # item2idx = {}
+        # idx2item = {}
+        # total = self.batch_size * self.maxlen
+        # A = np.zeros((total, total))
+        # item_batch_set = set(np.reshape(np.array(hist_item_list), total))
+        # for user_id in user_id_list:
+        #     item_list = [x[0] for x in self.graph[user_id]]
+        #     for item_i in item_list:
+        #         for item_j in item_list:
 
         return (user_id_list, item_id_list), (adj_matrix_list, time_matrix_list), (hist_item_list, hist_mask_list)
